@@ -1,10 +1,13 @@
 import argparse
 import asyncio
 import logging
+import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from typing import AsyncIterable, Any, TypeVar, List
 
+import aiohttp as aiohttp
 import colorama
 from colorama import Fore
 from selenium import webdriver
@@ -26,7 +29,7 @@ class RomDriver:
     with open('jquery-3.3.1.min.js') as f:
         jq = f.read()
 
-    headless: bool = False
+    headless: bool = True
     lock: asyncio.Lock = None
     driver_instances = 0
     driver_queue: asyncio.Queue = None
@@ -286,6 +289,7 @@ class Rom:
                 SELECT ID, TITLE, PLATFORM, DESCRIPTION_PAGE, LANDING_PAGE, DOWNLOAD_URL, DOWNLOADED, NOT_FOUND
                 FROM ROM
                 WHERE DESCRIPTION_PAGE IS NOT NULL AND LANDING_PAGE IS NULL
+                LIMIT 25
             '''
             c.execute(sql)
         else:
@@ -293,6 +297,7 @@ class Rom:
                     SELECT ID, TITLE, PLATFORM, DESCRIPTION_PAGE, LANDING_PAGE, DOWNLOAD_URL, DOWNLOADED, NOT_FOUND
                     FROM ROM
                     WHERE DESCRIPTION_PAGE IS NOT NULL AND LANDING_PAGE IS NULL AND PLATFORM = ?
+                    LIMIT 25
             '''
             c.execute(sql, [platform])
 
@@ -372,7 +377,7 @@ class Rom:
                 SELECT ID, TITLE, PLATFORM, DESCRIPTION_PAGE, LANDING_PAGE, DOWNLOAD_URL, DOWNLOADED, NOT_FOUND
                 FROM ROM
                 WHERE LANDING_PAGE IS NOT NULL AND DOWNLOAD_URL IS NULL
-                LIMIT 100
+                LIMIT 25
                 
             '''
             c.execute(sql)
@@ -381,7 +386,7 @@ class Rom:
                 SELECT ID, TITLE, PLATFORM, DESCRIPTION_PAGE, LANDING_PAGE, DOWNLOAD_URL, DOWNLOADED, NOT_FOUND
                 FROM ROM
                 WHERE LANDING_PAGE IS NOT NULL AND DOWNLOAD_URL IS NULL AND PLATFORM = ?
-                LIMIT 100
+                LIMIT 25
             '''
             c.execute(sql, [platform])
 
@@ -425,6 +430,107 @@ class Rom:
                 SELECT COUNT(*)
                 FROM ROM
                 WHERE LANDING_PAGE IS NOT NULL AND DOWNLOAD_URL IS NOT NULL AND PLATFORM = ?
+            '''
+            c.execute(sql, [platform])
+        return c.fetchone()[0]
+
+    @staticmethod
+    async def has_landing_pages_to_scrape(conn: sqlite3.Connection, platform: str) -> bool:
+        c = conn.cursor()
+        if platform == 'ALL':
+            sql = '''
+                SELECT COUNT(*)
+                FROM ROM
+                WHERE DESCRIPTION_PAGE IS NOT NULL AND LANDING_PAGE IS NULL
+            '''
+            c.execute(sql)
+        else:
+            sql = '''
+                SELECT COUNT(*)
+                FROM ROM
+                WHERE DESCRIPTION_PAGE IS NOT NULL AND LANDING_PAGE IS NULL AND PLATFORM = ?
+            '''
+            c.execute(sql, [platform])
+        return c.fetchone()[0] > 0
+
+    @staticmethod
+    async def has_roms_to_download(conn: sqlite3.Connection, platform: str) -> bool:
+        c = conn.cursor()
+        if platform == 'ALL':
+            sql = '''
+                SELECT COUNT(*)
+                FROM ROM
+                WHERE DOWNLOAD_URL IS NOT NULL AND DOWNLOADED IS NULL AND NOT_FOUND IS NULL
+            '''
+            c.execute(sql)
+        else:
+            sql = '''
+                SELECT COUNT(*)
+                FROM ROM
+                WHERE DOWNLOAD_URL IS NOT NULL AND DOWNLOADED IS NULL AND NOT_FOUND IS NULL AND PLATFORM = ?
+            '''
+            c.execute(sql, [platform])
+        return c.fetchone()[0] > 0
+
+    @staticmethod
+    async def fetch_roms_ready_to_download(conn: sqlite3.Connection, platform: str) -> AsyncIterable[NewRom]:
+        c = conn.cursor()
+        if platform == 'ALL':
+            sql = f'''
+                SELECT ID, TITLE, PLATFORM, DESCRIPTION_PAGE, LANDING_PAGE, DOWNLOAD_URL, DOWNLOADED, NOT_FOUND
+                FROM ROM
+                WHERE DOWNLOAD_URL IS NOT NULL AND DOWNLOADED IS NULL AND NOT_FOUND IS NULL
+                LIMIT {NUM_WORKERS}
+            '''
+            c.execute(sql)
+        else:
+            sql = f'''
+                SELECT ID, TITLE, PLATFORM, DESCRIPTION_PAGE, LANDING_PAGE, DOWNLOAD_URL, DOWNLOADED, NOT_FOUND
+                FROM ROM
+                WHERE DOWNLOAD_URL IS NOT NULL AND DOWNLOADED IS NULL AND NOT_FOUND IS NULL AND PLATFORM = ?
+                LIMIT {NUM_WORKERS}
+            '''
+            c.execute(sql, [platform])
+        for row in c.fetchall():
+            yield Rom(id=row[0],
+                      title=row[1],
+                      platform=row[2],
+                      description_page_url=row[3],
+                      landing_page=row[4],
+                      download_url=row[5],
+                      downloaded=row[6],
+                      not_found=row[7])
+
+    async def mark_downloaded(self, conn: sqlite3.Connection, color: int) -> None:
+        sql = '''
+            UPDATE ROM
+            SET DOWNLOADED = ?
+            WHERE ID = ?
+        '''
+        c = conn.cursor()
+        c.execute(sql, (self.downloaded, self.id))
+        conn.commit()
+        if not color:
+            color = self.color
+        await print_color(color,
+                          f'{self.__class__.__name__}-{self.platform}',
+                          f'Downloaded = {self.title}')
+
+    @staticmethod
+    async def count_roms_to_download(conn: sqlite3.Connection, platform: str) -> int:
+        c = conn.cursor()
+        if platform == 'ALL':
+            sql = '''
+                SELECT COUNT(*)
+                FROM ROM
+                WHERE DOWNLOAD_URL IS NOT NULL AND DOWNLOADED IS NOT NULL AND NOT_FOUND IS NULL
+            '''
+            c.execute(sql)
+        else:
+            sql = '''
+                SELECT COUNT(*)
+                FROM ROM
+                WHERE DOWNLOAD_URL IS NOT NULL AND DOWNLOADED IS NOT NULL AND NOT_FOUND IS NULL AND PLATFORM = ?
             '''
             c.execute(sql, [platform])
         return c.fetchone()[0]
@@ -623,20 +729,24 @@ async def scrape_landing_page_progress(conn: sqlite3.Connection, platform: str) 
 
 
 async def scrape_landing_pages(conn: sqlite3.Connection, platform: str) -> None:
-    queue = asyncio.Queue()
-    async for rom in Rom.fetch_all_by_where_description_is_not_null_and_landing_page_is_null(conn, platform):
-        await queue.put(rom)
-    console_colors = await color_list(queue.qsize())
-    tasks = []
-    for i in range(queue.qsize()):
-        tasks.append(
-            asyncio.create_task(
-                scrape_landing_page(conn, queue, console_colors.pop(0))))
-        if i % 20 == 0:
-            tasks.append(asyncio.create_task(scrape_landing_page_progress(conn, platform)))
-    await queue.join()
-    for t in tasks:
-        t.cancel()
+    has_work = await Rom.has_landing_pages_to_scrape(conn, platform)
+    while has_work:
+        queue = asyncio.Queue()
+        async for rom in Rom.fetch_all_by_where_description_is_not_null_and_landing_page_is_null(conn, platform):
+            await queue.put(rom)
+        console_colors = await color_list(queue.qsize())
+        tasks = []
+        for i in range(queue.qsize()):
+            tasks.append(
+                asyncio.create_task(
+                    scrape_landing_page(conn, queue, console_colors.pop(0))))
+            if i % 20 == 0:
+                tasks.append(asyncio.create_task(scrape_landing_page_progress(conn, platform)))
+        await queue.join()
+        for t in tasks:
+            t.cancel()
+        has_work = await Rom.has_landing_pages_to_scrape(conn, platform)
+        await print_color(Fore.WHITE, 'scrape_landing_pages', 'Gathering more work...')
 
 
 async def scrape_download_url(conn: sqlite3.Connection, queue: asyncio.Queue, color: int,
@@ -656,7 +766,7 @@ async def scrape_download_url(conn: sqlite3.Connection, queue: asyncio.Queue, co
         finally:
             await driver.close()
     await rom.save_download_url(conn, color)
-    await queue.task_done()
+    queue.task_done()
 
 
 async def scrape_download_url_progress(conn: sqlite3.Connection, platform: str) -> None:
@@ -696,6 +806,87 @@ async def scrape_download_urls(conn: sqlite3.Connection, platform: str) -> None:
         await print_color(Fore.WHITE, 'scrape_download_urls', 'Gathering more work...')
 
 
+async def download_rom_progress(conn: sqlite3.Connection, platform: str) -> None:
+    roms = await Rom.count_roms_to_download(conn, platform)
+    all_roms = await Rom.count_all(conn, platform)
+    per = (float(roms) / float(all_roms)) * 100
+    await print_color(Fore.LIGHTYELLOW_EX, 'Download Rom Progress', '{0:.2f}% Completed'.format(per))
+
+
+async def download_roms(conn: sqlite3.Connection, platform: str) -> None:
+    has_work = await Rom.has_roms_to_download(conn, platform)
+    while has_work:
+        queue = asyncio.Queue()
+        sem = asyncio.Semaphore(NUM_WORKERS)
+
+        async for rom in Rom.fetch_roms_ready_to_download(conn, platform):
+            await queue.put(rom)
+        console_colors = await color_list(queue.qsize())
+
+        tasks = []
+        for i in range(queue.qsize()):
+            tasks.append(
+                asyncio.create_task(
+                    download_rom(conn, queue, console_colors.pop(0))
+                )
+            )
+
+        tasks.append(
+            asyncio.create_task(
+                download_rom_progress(conn, platform)
+            )
+        )
+        await queue.join()
+        for t in tasks:
+            t.cancel()
+
+        await print_color(Fore.WHITE, 'download_roms', 'Gathering more work...')
+        has_work = await Rom.has_roms_to_download(conn, platform)
+
+
+async def download_rom(conn: sqlite3.Connection, queue: asyncio.Queue, color: int) -> None:
+    rom: Rom = await queue.get()
+    download_folder = await make_save_dir()
+    platform_folder = await make_platform_dir(download_folder, rom)
+    f_extension = rom.download_url.split('.')[-1]
+    f_path = os.path.join(os.path.sep, platform_folder, rom.title + '.' + f_extension)
+
+    if os.path.exists(f_path):
+        f_path = f_path + '.' + str(int(round(time.time() * 1000)))
+
+    await perform_rom_download(rom, f_path)
+    await rom.mark_downloaded(conn, color)
+    queue.task_done()
+
+
+async def perform_rom_download(rom: Rom, f_path: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(rom.download_url) as response:
+                file_bytes = await response.read()
+                with open(f_path, 'wb') as f:
+                    f.write(file_bytes)
+                    rom.downloaded = True
+    except Exception as e:
+        logger.exception(f'Failed to download {rom.title}', e)
+
+
+async def make_save_dir() -> str:
+    rom_dir = os.path.join(os.path.sep, os.getcwd(), 'downloads')
+    if not os.path.exists(rom_dir):
+        os.mkdir(rom_dir)
+
+    return rom_dir
+
+
+async def make_platform_dir(rom_dir: str, rom: Rom) -> str:
+    platform_dir = os.path.join(os.path.sep, rom_dir, rom.platform.replace(' ', '_'))
+    if not os.path.exists(platform_dir):
+        os.mkdir(platform_dir)
+
+    return platform_dir
+
+
 async def main(platform: str) -> None:
     try:
         conn = await open_db()
@@ -712,7 +903,10 @@ async def main(platform: str) -> None:
         if can_proceed:
             await scrape_rom_titles(conn, platform)
             await scrape_landing_pages(conn, platform)
+            await RomDriver.tear_down()
+
             await scrape_download_urls(conn, platform)
+            await download_roms(conn, platform)
         else:
             logger.info(f'Unable to continue because {platform} is not found! Exiting...')
 
